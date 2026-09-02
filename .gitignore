@@ -1,0 +1,23 @@
+# Ambientes virtuais
+venv/
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+
+# Arquivos de dados pesados e locais
+data/
+*.shp
+*.shx
+*.dbf
+*.prj
+*.geojson
+*.kml
+*.gpkg
+
+# Variáveis de ambiente e IDEs
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
