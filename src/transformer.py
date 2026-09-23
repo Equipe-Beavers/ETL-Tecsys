@@ -4,14 +4,23 @@ import geopandas as gpd
 import psycopg2
 from tqdm import tqdm
 from .extractor import get_raw_paste
-from .query.raw_to_silver  import return_sql_query
+
+LAYER_ALIASES = {
+    "PONNOT": ("PONNOT",),
+    "SUB": ("SUB",),
+    "UNSEAT": ("UNSEAT", "UNSEBT", "UNSEMT"),
+    "UNTRD": ("UNTRD", "UNTRAT", "UNTRBT", "UNTRMT"),
+    "UNREGT": ("UNREGT", "UNREAT", "UNREBT", "UNREMT"),
+    "UNCR": ("UNCR", "UNCRAT", "UNCRBT", "UNCRMT"),
+}
 
 LAYERS_CONFIG = {
     "PONNOT": ["COD_ID", "DIST", "MUN", "ARE_LOC", "TIP_PN", "MAT", "ESF", "ALT", "SITCONT", "SUB", "CONJ"],
-    "UNTRD":  ["COD_ID", "DIST", "MUN", "ARE_LOC", "POT_NOM", "PAC_1", "PAC_2", "SITCONT", "SUB", "CONJ"],
-    "UNSEAT": ["COD_ID", "DIST", "MUN", "ARE_LOC", "TIP_UNID", "P_NOM", "SITCONT", "SUB", "CONJ"],
+    "UNTRD":  ["COD_ID", "DIST", "MUN", "ARE_LOC", "POT_NOM", "PAC_1", "PAC_2", "SITCONT", "SIT_ATIV", "TIP_UNID", "SUB", "CONJ"],
+    "UNSEAT": ["COD_ID", "DIST", "MUN", "ARE_LOC", "TIP_UNID", "P_NOM", "SITCONT", "SIT_ATIV", "SUB", "CONJ"],
     "SUB":    ["COD_ID", "DIST", "MUN", "NOME", "SITCONT"],
-    "UNREGT": ["COD_ID", "DIST", "MUN", "ARE_LOC", "POT_NOM", "SITCONT", "SUB", "CONJ"]
+    "UNREGT": ["COD_ID", "DIST", "MUN", "ARE_LOC", "POT_NOM", "SITCONT", "SIT_ATIV", "TIP_UNID", "SUB", "CONJ"],
+    "UNCR":   ["COD_ID", "DIST", "MUN", "ARE_LOC", "POT_NOM", "SITCONT", "SIT_ATIV", "TIP_UNID", "SUB", "CONJ"],
 }
 
 def find_gdb_paste(raw_dir: str) -> tuple [str, str]:
@@ -35,30 +44,41 @@ def transform_bdgd_layer(layer_name: str) -> tuple[pandas.DataFrame, str]:
     except Exception:
         available_layers = []
 
-    matched_layer = next((l for l in available_layers if l.upper() == layer_name.upper()), None)
+    aliases = LAYER_ALIASES.get(layer_name.upper(), (layer_name.upper(),))
+    matched_layers = [
+        layer for layer in available_layers
+        if layer.upper() in aliases
+    ]
 
-    if not matched_layer:
-        raise ValueError(f"Layer '{layer_name}' não existe no GDB.")
+    if not matched_layers:
+        print(f"Aviso: Camada '{layer_name}' não encontrada no GDB (esperadas: {', '.join(aliases)}). Retornando DataFrame vazio.")
+        target_columns = LAYERS_CONFIG.get(layer_name.upper(), ["COD_ID", "DIST", "MUN", "SITCONT"])
+        columns = ["Y", "X"] + target_columns
+        empty_df = pandas.DataFrame(columns=columns)
+        return empty_df, paste_name
 
-    gdf = gpd.read_file(gdb_path, layer=matched_layer)
-    
-    if gdf.empty:
-        raise ValueError(f"Layer '{layer_name}' está vazia.")
+    frames = []
+    target_columns = LAYERS_CONFIG.get(layer_name.upper(), ["COD_ID", "DIST", "MUN", "SITCONT"])
+    for matched_layer in matched_layers:
+        gdf = gpd.read_file(gdb_path, layer=matched_layer)
+        if gdf.empty:
+            continue
 
-    gdf = gdf.to_crs(epsg=4326)
-    centroids = gdf.geometry.apply(lambda geom: geom.centroid if geom and not geom.is_empty else None)
-    gdf["X"] = centroids.x
-    gdf["Y"] = centroids.y
-    target_columns = LAYERS_CONFIG.get(layer_name, ["COD_ID", "DIST", "MUN", "SITCONT"])
+        gdf = gdf.to_crs(epsg=4326)
+        centroids = gdf.geometry.apply(
+            lambda geom: geom.centroid if geom is not None and not geom.is_empty else None
+        )
+        gdf["X"] = centroids.x
+        gdf["Y"] = centroids.y
+        columns = ["Y", "X"] + [col for col in target_columns if col in gdf.columns]
+        frame = pandas.DataFrame(gdf[columns])
+        frame["CAMADA_BDGD"] = matched_layer
+        frames.append(frame)
 
-    if "SUB" in gdf.columns and "SUB" not in target_columns:
-        target_columns.append("SUB")
-    elif "CONJ" in gdf.columns and "CONJ" not in target_columns:
-        target_columns.append("CONJ")
+    if not frames:
+        raise ValueError(f"As camadas encontradas para '{layer_name}' estão vazias.")
 
-    cols_to_keep = ["Y", "X"] + [col for col in target_columns if col in gdf.columns]
-    df_transformed = pandas.DataFrame(gdf[cols_to_keep])
-    df_transformed = df_transformed.drop_duplicates()
+    df_transformed = pandas.concat(frames, ignore_index=True).drop_duplicates()
 
     print(f"Transformação concluída! Total de registros: {len(df_transformed)}")
 
@@ -86,7 +106,8 @@ DB_CONFIG = {
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432")
+    "port": os.getenv("DB_PORT", "5432"),
+    "sslmode": "require" if os.getenv("DB_SSL", "").lower() == "true" else "prefer",
 }
 
 def get_current_lote() -> str:
@@ -95,6 +116,8 @@ def get_current_lote() -> str:
     return f"{now.year}_{now.month:02d}_{fortnight}"
 
 def transform_raw_to_silver():
+    from .query.raw_to_silver import return_sql_query
+
     lote_atual = get_current_lote()
     queries = return_sql_query()
 

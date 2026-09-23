@@ -2,6 +2,7 @@ from src.extractor import clean_raw_paste, download_and_extract_zip
 from src.transformer import transform_bdgd_layer
 from src.loader import save_to_csv, get_processed_folder, load_all_csvs_directly
 from datetime import datetime
+import os
 
 BDGD_URL = [
     ["https://www.arcgis.com/sharing/rest/content/items/f7ef6c74ffe74311bb20ef0b83e4070e/data", "Sulgipe_46_2025-12-31 V11"],
@@ -62,7 +63,7 @@ BDGD_URL = [
     ["https://www.arcgis.com/sharing/rest/content/items/26f6d3e8e9f74d89921e74eed6213545/data", "Chesp 103 2025-12-31 V11"],
 ]
 
-TARGET_LAYERS = ["PONNOT", "UNTRD", "UNSEAT", "SUB", "UNREGT"]
+TARGET_LAYERS = ["PONNOT", "SUB", "UNSEAT", "UNCR", "UNTRD", "UNREGT"]
 LAYERS_CONFIG = [
     {
         "extension": "PONNOT",
@@ -81,10 +82,33 @@ LAYERS_CONFIG = [
     }
 ]
 
+def get_selected_databases() -> list[tuple[str, str]]:
+    """Seleciona bases por nome; sem filtro, mantém o processamento completo."""
+    selected = os.getenv("BDGD_DISTRIBUIDORAS", "").strip()
+    if not selected:
+        return BDGD_URL
+
+    requested = {item.strip().casefold() for item in selected.split(",") if item.strip()}
+    databases = [
+        database for database in BDGD_URL
+        if any(term in database[1].casefold() for term in requested)
+    ]
+    if not databases:
+        available = ", ".join(name for _, name in BDGD_URL)
+        raise ValueError(
+            "Nenhuma distribuidora corresponde a BDGD_DISTRIBUIDORAS. "
+            f"Opções disponíveis: {available}"
+        )
+    return databases
+
 def run_pipeline():
-    print(F"TOTAL DE BASES DE DADOS: {len(BDGD_URL)}")
+    databases = get_selected_databases()
+    print(F"TOTAL DE BASES DE DADOS: {len(databases)}")
+    print("BASES SELECIONADAS:")
+    for _, name in databases:
+        print(f"  - {name}")
     print("=" * 15 + "INICIANDO PIPELINE - ETL (BDGD)" + "=" * 15)
-    for index, (url, nome_distribuidora) in enumerate(BDGD_URL, 1):
+    for index, (url, nome_distribuidora) in enumerate(databases, 1):
         print("#" * 60)
         print(f"[INICIADO] - PROCESSANDO BASE [{index}/{len(BDGD_URL)}] - {nome_distribuidora}")
         try:

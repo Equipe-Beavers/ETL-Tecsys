@@ -1,4 +1,5 @@
 import os
+import json
 import pandas
 import glob
 import psycopg2
@@ -15,7 +16,8 @@ DB_CONFIG = {
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", 5432)
+    "port": os.getenv("DB_PORT", 5432),
+    "sslmode": "require" if os.getenv("DB_SSL", "").lower() == "true" else "prefer",
 }
 
 month_map  = {
@@ -91,6 +93,24 @@ def clean_num(series, is_int=False):
         return pandas.to_numeric(s, errors='coerce').astype('Int64')
     return pandas.to_numeric(s, errors='coerce')
 
+def distributor_from_filename(file_path: str) -> str:
+    filename = os.path.basename(file_path).casefold()
+    if "enel_sp" in filename:
+        return "Enel SP"
+    if "edp_sp" in filename:
+        return "EDP SP"
+    if "energisa_minas_rio" in filename:
+        return "Energisa Minas Rio"
+    return "Desconhecida"
+
+
+def selected_distributors() -> set[str] | None:
+    configured = os.getenv("BDGD_DISTRIBUIDORAS")
+    if not configured:
+        return None
+    values = {value.strip() for value in configured.split(",") if value.strip()}
+    return values or None
+
 
 def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
     conn = psycopg2.connect(**DB_CONFIG)
@@ -98,12 +118,29 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
 
     try:
         cur.execute("SET synchronous_commit = OFF;")
+        cur.execute(
+            "TRUNCATE TABLE postes, subestacoes, dispositivos, "
+            "transformadores, reguladores, "
+            "posicoes_geograficas RESTART IDENTITY CASCADE;"
+        )
+        cur.execute("TRUNCATE TABLE ativos_rede RESTART IDENTITY;")
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_posicoes_geograficas_lookup
+                ON posicoes_geograficas
+                    (latitude, longitude, tipo_posicao, lote_carga, registro_atual);
+        """)
         
         layers_config = {
             'PONNOT': {'tipo_pos': 'POSTE'},
             'SUB':     {'tipo_pos': 'SUBESTACAO'},
-            'UNSEAT': {'tipo_pos': 'DISPOSITIVO'}
+            'UNTRD':   {'tipo_pos': 'TRANSFORMADOR'},
+            'UNSEAT':  {'tipo_pos': 'DISPOSITIVO'},
+            'UNCR':    {'tipo_pos': 'DISPOSITIVO'},
+            'UNREGT':  {'tipo_pos': 'REGULADOR_TENSAO'}
         }
+        device_layers = {'UNSEAT', 'UNCR'}
+        ativos_rede = []
+        allowed_distributors = selected_distributors()
 
         for prefix, cfg in layers_config.items():
             csv_files = glob.glob(os.path.join(data_folder_path, f"*{prefix}*.csv"))
@@ -118,6 +155,10 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
             list_negociais = []
 
             for file_path in tqdm(csv_files, desc=f"Lendo CSVs {prefix}"):
+                distributor = distributor_from_filename(file_path)
+                if allowed_distributors is not None and distributor not in allowed_distributors:
+                    continue
+
                 df = None
                 for enc in ['cp1252', 'latin1', 'iso-8859-1', 'utf-8-sig']:
                     try:
@@ -143,6 +184,7 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                 df['latitude'] = clean_num(df[col_y])
                 df['longitude'] = clean_num(df[col_x])
                 df = df.dropna(subset=['latitude', 'longitude'])
+                df['distribuidora'] = distributor
 
                 if df.empty:
                     continue
@@ -152,10 +194,38 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                     'longitude': df['longitude'],
                     'tipo_posicao': cfg['tipo_pos'],
                     'municipio': df['MUN'].str.strip() if 'MUN' in df.columns else None,
+                    'bairro': df['BAIRRO'].str.strip() if 'BAIRRO' in df.columns else None,
+                    'distribuidora': df['distribuidora'],
                     'registro_atual': True,
                     'lote_carga': lote_atual
                 })
                 list_posicoes.append(df_pos)
+
+                tipo_ativo = cfg['tipo_pos']
+                if prefix in device_layers:
+                    tipo_ativo = 'DISPOSITIVO'
+                for row in df.to_dict('records'):
+                    atributos = {
+                        str(key).lower(): (
+                            None if pandas.isna(value) else value
+                        )
+                        for key, value in row.items()
+                        if key not in {'X', 'Y', 'latitude', 'longitude',
+                                       'COD_ID', 'MUN', 'BAIRRO'}
+                    }
+                    ativos_rede.append((
+                        str(row.get('COD_ID', '')).strip() or None,
+                        tipo_ativo,
+                        prefix,
+                        float(row['latitude']),
+                        float(row['longitude']),
+                        str(row.get('MUN', '')).strip() or None,
+                        str(row.get('BAIRRO', '')).strip() or None,
+                        df['distribuidora'].iloc[0],
+                        json.dumps(atributos, default=str),
+                        True,
+                        lote_atual,
+                    ))
 
                 cod_id_col = df['COD_ID'].str.strip() if 'COD_ID' in df.columns else None
 
@@ -164,7 +234,7 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                         'cod_id': cod_id_col,
                         'altura': clean_num(df['ALT']) if 'ALT' in df.columns else None,
                         'material': df['MAT'].str.strip() if 'MAT' in df.columns else None,
-                        'esforco': clean_num(df['EST']) if 'EST' in df.columns else None,
+                        'esforco': clean_num(df['ESF']) if 'ESF' in df.columns else None,
                         'latitude': df['latitude'],
                         'longitude': df['longitude'],
                         'registro_atual': True,
@@ -183,11 +253,40 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                     })
                     list_negociais.append(df_neg)
 
-                elif prefix == 'UNSEAT':
+                elif prefix in device_layers:
                     tip_unid = clean_num(df['TIP_UNID'], is_int=True).fillna(0) if 'TIP_UNID' in df.columns else 0
+                    tip_unid = tip_unid.where(tip_unid.between(0, 43), 0)
                     df_neg = pandas.DataFrame({
                         'cod_id': cod_id_col,
                         'id_tipo_dispositivo': tip_unid,
+                        'subestacao': df['SUB'].str.strip() if 'SUB' in df.columns else None,
+                        'codigo_conjunto_aneel': clean_num(df['CONJ'], is_int=True) if 'CONJ' in df.columns else None,
+                        'latitude': df['latitude'],
+                        'longitude': df['longitude'],
+                        'registro_atual': True,
+                        'lote_carga': lote_atual
+                    })
+                    list_negociais.append(df_neg)
+
+                elif prefix == 'UNTRD':
+                    df_neg = pandas.DataFrame({
+                        'cod_id': cod_id_col,
+                        'potencia_nominal': clean_num(df['POT_NOM']) if 'POT_NOM' in df.columns else None,
+                        'ponto_alimentacao_1': df['PAC_1'].str.strip() if 'PAC_1' in df.columns else None,
+                        'ponto_alimentacao_2': df['PAC_2'].str.strip() if 'PAC_2' in df.columns else None,
+                        'subestacao': df['SUB'].str.strip() if 'SUB' in df.columns else None,
+                        'codigo_conjunto_aneel': clean_num(df['CONJ'], is_int=True) if 'CONJ' in df.columns else None,
+                        'latitude': df['latitude'],
+                        'longitude': df['longitude'],
+                        'registro_atual': True,
+                        'lote_carga': lote_atual
+                    })
+                    list_negociais.append(df_neg)
+
+                elif prefix == 'UNREGT':
+                    df_neg = pandas.DataFrame({
+                        'cod_id': cod_id_col,
+                        'potencia_nominal': clean_num(df['POT_NOM']) if 'POT_NOM' in df.columns else None,
                         'subestacao': df['SUB'].str.strip() if 'SUB' in df.columns else None,
                         'codigo_conjunto_aneel': clean_num(df['CONJ'], is_int=True) if 'CONJ' in df.columns else None,
                         'latitude': df['latitude'],
@@ -201,18 +300,27 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                 print(f"[AVISO] Nenhum dado válido extraído para a camada {prefix}")
                 continue
 
-            df_full_pos = pandas.concat(list_posicoes, ignore_index=True).drop_duplicates(subset=['latitude', 'longitude', 'tipo_posicao'])
-            df_full_neg = pandas.concat(list_negociais, ignore_index=True)
+            df_full_pos = pandas.concat(list_posicoes, ignore_index=True).drop_duplicates(
+                subset=['latitude', 'longitude', 'tipo_posicao', 'distribuidora']
+            )
+            df_full_neg = (
+                pandas.concat(list_negociais, ignore_index=True)
+                if list_negociais else pandas.DataFrame()
+            )
 
             print(f"Inserindo {len(df_full_pos)} posições no banco...")
             buf_pos = StringIO()
-            df_full_pos[['tipo_posicao', 'latitude', 'longitude', 'municipio', 'registro_atual', 'lote_carga']].to_csv(buf_pos, index=False, header=False, sep='\t')
+            df_full_pos[
+                ['tipo_posicao', 'latitude', 'longitude', 'municipio', 'bairro', 'distribuidora',
+                 'registro_atual', 'lote_carga']
+            ].to_csv(buf_pos, index=False, header=False, sep='\t')
             buf_pos.seek(0)
             
             cur.copy_expert("""
-                COPY posicoes_geograficas (tipo_posicao, latitude, longitude, municipio, registro_atual, lote_carga)
+                COPY posicoes_geograficas (tipo_posicao, latitude, longitude, municipio, bairro, distribuidora, registro_atual, lote_carga)
                 FROM STDIN WITH (FORMAT csv, DELIMITER '\t', NULL '');
             """, buf_pos)
+            cur.execute("ANALYZE posicoes_geograficas;")
 
             print(f"Inserindo {len(df_full_neg)} registros na tabela negocial...")
             
@@ -231,6 +339,55 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                       ON g.latitude = t.latitude 
                      AND g.longitude = t.longitude 
                      AND g.tipo_posicao = 'POSTE' 
+                     AND g.lote_carga = t.lote_carga
+                     AND g.registro_atual = TRUE;
+                """)
+
+            elif prefix == 'UNTRD':
+                cur.execute("CREATE TEMP TABLE temp_transformadores (cod_id VARCHAR(80), potencia_nominal NUMERIC, ponto_alimentacao_1 VARCHAR(80), ponto_alimentacao_2 VARCHAR(80), subestacao VARCHAR(80), codigo_conjunto_aneel INT, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, registro_atual BOOLEAN, lote_carga VARCHAR(20)) ON COMMIT DROP;")
+                buf_neg = StringIO()
+                df_full_neg.to_csv(buf_neg, index=False, header=False, sep='\t')
+                buf_neg.seek(0)
+                cur.copy_expert("COPY temp_transformadores FROM STDIN WITH (FORMAT csv, DELIMITER '\t', NULL '');", buf_neg)
+                cur.execute("""
+                    INSERT INTO transformadores (
+                        cod_id, potencia_nominal, ponto_alimentacao_1,
+                        ponto_alimentacao_2, subestacao, codigo_conjunto_aneel,
+                        id_posicao, registro_atual, lote_carga
+                    )
+                    SELECT t.cod_id, t.potencia_nominal, t.ponto_alimentacao_1,
+                           t.ponto_alimentacao_2, t.subestacao,
+                           t.codigo_conjunto_aneel, g.id_posicao,
+                           t.registro_atual, t.lote_carga
+                    FROM temp_transformadores t
+                    JOIN posicoes_geograficas g
+                      ON g.latitude = t.latitude
+                     AND g.longitude = t.longitude
+                     AND g.tipo_posicao = 'TRANSFORMADOR'
+                     AND g.lote_carga = t.lote_carga
+                     AND g.registro_atual = TRUE;
+                """)
+
+            elif prefix == 'UNREGT':
+                cur.execute("CREATE TEMP TABLE temp_reguladores (cod_id VARCHAR(80), potencia_nominal NUMERIC, subestacao VARCHAR(80), codigo_conjunto_aneel INT, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, registro_atual BOOLEAN, lote_carga VARCHAR(20)) ON COMMIT DROP;")
+                buf_neg = StringIO()
+                df_full_neg.to_csv(buf_neg, index=False, header=False, sep='\t')
+                buf_neg.seek(0)
+                cur.copy_expert("COPY temp_reguladores FROM STDIN WITH (FORMAT csv, DELIMITER '\t', NULL '');", buf_neg)
+                cur.execute("""
+                    INSERT INTO reguladores (
+                        cod_id, potencia_nominal, subestacao,
+                        codigo_conjunto_aneel, id_posicao,
+                        registro_atual, lote_carga
+                    )
+                    SELECT t.cod_id, t.potencia_nominal, t.subestacao,
+                           t.codigo_conjunto_aneel, g.id_posicao,
+                           t.registro_atual, t.lote_carga
+                    FROM temp_reguladores t
+                    JOIN posicoes_geograficas g
+                      ON g.latitude = t.latitude
+                     AND g.longitude = t.longitude
+                     AND g.tipo_posicao = 'REGULADOR_TENSAO'
                      AND g.lote_carga = t.lote_carga
                      AND g.registro_atual = TRUE;
                 """)
@@ -254,7 +411,8 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                      AND g.registro_atual = TRUE;
                 """)
 
-            elif prefix == 'UNSEAT':
+            elif prefix in device_layers:
+                cur.execute("DROP TABLE IF EXISTS temp_disp;")
                 cur.execute("CREATE TEMP TABLE temp_disp (cod_id VARCHAR(50), id_tipo_dispositivo INT, subestacao VARCHAR(50), codigo_conjunto_aneel INT, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, registro_atual BOOLEAN, lote_carga VARCHAR(20)) ON COMMIT DROP;")
                 buf_neg = StringIO()
                 df_full_neg.to_csv(buf_neg, index=False, header=False, sep='\t')
@@ -281,10 +439,24 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                      AND g.registro_atual = TRUE;
                 """)
 
+        if ativos_rede:
+            execute_values(
+                cur,
+                """
+                INSERT INTO ativos_rede (
+                     cod_id, tipo_ativo, camada_origem, latitude, longitude,
+                     municipio, bairro, distribuidora, atributos, registro_atual, lote_carga
+                ) VALUES %s
+                """,
+                ativos_rede,
+                page_size=5000,
+            )
+            print(f"Inserindo {len(ativos_rede)} ativos detalhados...")
+
         print("\nGerando geometrias PostGIS (ST_MakePoint)...")
         cur.execute("""
             UPDATE posicoes_geograficas 
-            SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4674)
+            SET geom = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
             WHERE geom IS NULL;
         """)
 
