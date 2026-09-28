@@ -1,4 +1,5 @@
 import os
+import re
 import pandas
 import glob
 import psycopg2
@@ -17,6 +18,22 @@ DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
     "port": os.getenv("DB_PORT", 5432)
 }
+
+CAMADAS_ATIVOS = {
+    'PONNOT': 'POSTE',
+    'SUB': 'SUBESTACAO',
+    'UNSEAT': 'DISPOSITIVO'
+}
+
+COLUNAS_ATIVOS_REDE = [
+    'cod_id', 'tipo_ativo', 'camada_origem', 'latitude', 'longitude',
+    'municipio', 'distribuidora', 'atributos', 'registro_atual', 'lote_carga'
+]
+
+COLUNAS_FORA_DOS_ATRIBUTOS = {'Y', 'X', 'LATITUDE', 'LONGITUDE', 'COD_ID', 'MUN', 'DIST'}
+
+# Ex.: "EDP_SP_391_2025-12-31_V11_20260830-0340_PONNOT.csv" -> "EDP SP"
+PADRAO_NOME_BASE = re.compile(r"^(?P<nome>.+?)[_ ]\d+[_ ]\d{4}-\d{2}-\d{2}")
 
 month_map  = {
     1: "janeiro", 2: "fevereiro", 3: "marco", 4: "abril",
@@ -53,6 +70,102 @@ def clean_num(series, is_int=False):
     return pandas.to_numeric(s, errors='coerce')
 
 
+def ler_csv(file_path: str) -> pandas.DataFrame | None:
+    for enc in ['cp1252', 'latin1', 'iso-8859-1', 'utf-8-sig']:
+        try:
+            df = pandas.read_csv(file_path, sep=';', dtype=str, encoding=enc, engine='python')
+            if len(df.columns) <= 1:
+                df = pandas.read_csv(file_path, sep=',', dtype=str, encoding=enc, engine='python')
+            df.columns = df.columns.str.strip().str.upper()
+            return df
+        except (UnicodeDecodeError, Exception):
+            continue
+    return None
+
+
+def nome_distribuidora(file_path: str) -> str | None:
+    correspondencia = PADRAO_NOME_BASE.match(os.path.basename(file_path))
+    if not correspondencia:
+        return None
+    return correspondencia.group("nome").replace("_", " ").strip().upper()
+
+
+def carregar_ativos_rede(data_folder_path: str, lote_atual: str):
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    try:
+        for camada, tipo_ativo in CAMADAS_ATIVOS.items():
+            csv_files = glob.glob(os.path.join(data_folder_path, f"*{camada}*.csv"))
+
+            for file_path in tqdm(csv_files, desc=f"Ativos de rede {camada}"):
+                distribuidora = nome_distribuidora(file_path)
+                df = ler_csv(file_path)
+
+                if distribuidora is None or df is None or 'Y' not in df.columns or 'X' not in df.columns:
+                    print(f"\n[PULANDO] Arquivo {os.path.basename(file_path)} sem distribuidora ou coordenadas válidas.")
+                    continue
+
+                df['LATITUDE'] = clean_num(df['Y'])
+                df['LONGITUDE'] = clean_num(df['X'])
+                df = df.dropna(subset=['LATITUDE', 'LONGITUDE'])
+
+                if df.empty:
+                    continue
+
+                colunas_atributos = [
+                    coluna for coluna in df.columns
+                    if coluna not in COLUNAS_FORA_DOS_ATRIBUTOS and not coluna.startswith('UNNAMED')
+                ]
+                atributos = (
+                    df[colunas_atributos]
+                    .rename(columns=str.lower)
+                    .to_json(orient='records', lines=True, force_ascii=False)
+                    .splitlines()
+                )
+
+                df_ativos = pandas.DataFrame({
+                    'cod_id': df['COD_ID'].str.strip() if 'COD_ID' in df.columns else None,
+                    'tipo_ativo': tipo_ativo,
+                    'camada_origem': camada,
+                    'latitude': df['LATITUDE'],
+                    'longitude': df['LONGITUDE'],
+                    'municipio': df['MUN'].str.strip() if 'MUN' in df.columns else None,
+                    'distribuidora': distribuidora,
+                    'atributos': atributos,
+                    'registro_atual': True,
+                    'lote_carga': lote_atual
+                })
+
+                cur.execute("""
+                    DELETE FROM ativos_rede
+                    WHERE camada_origem = %s AND distribuidora = %s AND lote_carga = %s;
+                """, (camada, distribuidora, lote_atual))
+                cur.execute("""
+                    UPDATE ativos_rede SET registro_atual = FALSE
+                    WHERE camada_origem = %s AND distribuidora = %s AND registro_atual = TRUE;
+                """, (camada, distribuidora))
+
+                buffer = StringIO()
+                df_ativos[COLUNAS_ATIVOS_REDE].to_csv(buffer, index=False, header=False, sep='\t')
+                buffer.seek(0)
+                cur.copy_expert(f"""
+                    COPY ativos_rede ({', '.join(COLUNAS_ATIVOS_REDE)})
+                    FROM STDIN WITH (FORMAT csv, DELIMITER '\t', NULL '');
+                """, buffer)
+
+        conn.commit()
+        print("\n[SUCESSO] Tabela ativos_rede atualizada!")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"\n[ERRO] Falha ao carregar ativos_rede: {e}")
+        raise e
+    finally:
+        cur.close()
+        conn.close()
+
+
 def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
@@ -79,20 +192,10 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
             list_negociais = []
 
             for file_path in tqdm(csv_files, desc=f"Lendo CSVs {prefix}"):
-                df = None
-                for enc in ['cp1252', 'latin1', 'iso-8859-1', 'utf-8-sig']:
-                    try:
-                        df = pandas.read_csv(file_path, sep=';', dtype=str, encoding=enc, engine='python')
-                        if len(df.columns) <= 1:
-                            df = pandas.read_csv(file_path, sep=',', dtype=str, encoding=enc, engine='python')
-                        break
-                    except (UnicodeDecodeError, Exception):
-                        continue
+                df = ler_csv(file_path)
 
                 if df is None or df.empty:
                     continue
-
-                df.columns = df.columns.str.strip().str.upper()
 
                 col_y = 'Y' if 'Y' in df.columns else ('LATITUDE' if 'LATITUDE' in df.columns else None)
                 col_x = 'X' if 'X' in df.columns else ('LONGITUDE' if 'LONGITUDE' in df.columns else None)
@@ -125,7 +228,7 @@ def load_all_csvs_directly(data_folder_path: str, lote_atual: str):
                         'cod_id': cod_id_col,
                         'altura': clean_num(df['ALT']) if 'ALT' in df.columns else None,
                         'material': df['MAT'].str.strip() if 'MAT' in df.columns else None,
-                        'esforco': clean_num(df['EST']) if 'EST' in df.columns else None,
+                        'esforco': clean_num(df['ESF']) if 'ESF' in df.columns else None,
                         'latitude': df['latitude'],
                         'longitude': df['longitude'],
                         'registro_atual': True,
