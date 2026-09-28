@@ -43,46 +43,7 @@ def save_to_csv(df: pandas.DataFrame, base_name: str, layer_name: str) -> str:
     print(f"Arquivo CSV salvo com sucesso em: {csv_path}")
     return csv_path
 
-def load_csv_to_postegres(bdgd_layer: str, table_name: str, columns: str, truncate_before: bool = True):
-    target_folder = get_processed_folder()
-    csv_files = glob.glob(os.path.join(target_folder, f"*_{bdgd_layer}.csv"))
-
-    if not csv_files:
-        raise FileNotFoundError(f"Nenhum arquivo CSV encontrado no camiminho especificado ({target_folder})")
-
-    print(f"Conectando ao banco de dados.")
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-
-    if truncate_before:
-        print(f"Esvaziando a tabela {table_name} para inserir os dados da nova quinzena (TRUNCATE)...")
-        cursor.execute(f"TRUNCATE TABLE raw.{table_name} RESTART IDENTITY;")
-        conn.commit()
-
-    cols_to_insert = ", ".join(columns)
-    query = f"INSERT INTO raw.{table_name} ({cols_to_insert}) VALUES %s"
-
-    for file in csv_files:
-        print(f"Lendo e inserindo os dados do arquivo: {os.path.basename(file)}")
-        df = pandas.read_csv(file, dtype=str)
-        df.columns = df.columns.str.upper()
-        df = df.where(pandas.notnull(df), None)
-
-        records = []
-        for row in df.itertuples(index=False):
-            record = tuple(getattr(row, col, None) for col in columns)
-            records.append(record)
-
-        execute_values(cursor, query, records, page_size=10000)
-        conn.commit()
-        print(f"[CONCLUÍDO] - {len(df)} dados inseridos com sucesso!")
-
-    cursor.close()
-    conn.close()
-    print(f"Carga da tabela raw.{table_name} finalizada!")
-
 def clean_num(series, is_int=False):
-    """Trata valores nulos, vírgulas e converte para numérico de forma rápida."""
     if series is None or series.empty:
         return pandas.Series(dtype='object')
     s = series.astype(str).str.strip().str.replace(',', '.')

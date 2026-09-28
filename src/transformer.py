@@ -3,6 +3,8 @@ import pandas
 import geopandas as gpd
 import psycopg2
 from tqdm import tqdm
+from dotenv import load_dotenv
+from datetime import datetime
 from .extractor import get_raw_paste
 from .query.raw_to_silver  import return_sql_query
 
@@ -65,20 +67,6 @@ def transform_bdgd_layer(layer_name: str) -> tuple[pandas.DataFrame, str]:
     return df_transformed, paste_name
 
 
-# PROCESSO DE TRATAMENTO DOS DADOS DA CAMADA RAW PARA SILVER
-DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", 5432)
-}
-
-import os
-import psycopg2
-from datetime import datetime
-from dotenv import load_dotenv
-
 load_dotenv()
 
 DB_CONFIG = {
@@ -93,42 +81,3 @@ def get_current_lote() -> str:
     now = datetime.now()
     fortnight = "01" if now.day <= 15 else "02"
     return f"{now.year}_{now.month:02d}_{fortnight}"
-
-def transform_raw_to_silver():
-    lote_atual = get_current_lote()
-    queries = return_sql_query()
-
-    etapas = [
-        "Inativando registros antigos (SCD2)",
-        "Inserindo Tipos de Dispositivos (ID 0)",
-        "Inserindo Tipos de Dispositivos (Desconhecidos)",
-        "Inserindo Posições Geográficas (Postes)",
-        "Inserindo Tabela Negocial (Postes)",
-        "Inserindo Posições Geográficas (Subestações)",
-        "Inserindo Tabela Negocial (Subestações)",
-        "Inserindo Posições Geográficas (Dispositivos)",
-        "Inserindo Tabela Negocial (Dispositivos)"
-    ]
-
-    conn = None
-    try:
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        cursor.execute("SET work_mem = '256MB';")
-        cursor.execute("SET synchronous_commit = OFF;")
-
-        with tqdm(total=len(queries), desc=f"Pipeline SILVER (Lote: {lote_atual})", unit="etapa") as pbar:
-            for query, etapa in zip(queries, etapas):
-                pbar.set_postfix_str(f"Executando: {etapa}")
-                cursor.execute(query, {"lote": lote_atual})
-                pbar.update(1)
-
-        conn.commit()
-        cursor.close()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise e
-    finally:
-        if conn:
-            conn.close()
