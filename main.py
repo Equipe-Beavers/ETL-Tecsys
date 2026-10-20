@@ -1,6 +1,6 @@
 from src.extractor import clean_raw_paste, download_and_extract_zip
 from src.transformer import transform_bdgd_layer
-from src.loader import save_to_csv, get_processed_folder, load_all_csvs_directly
+from src.loader import save_to_csv, get_processed_folder, load_all_csvs_directly, load_municipios
 from datetime import datetime
 
 BDGD_URL = [
@@ -115,7 +115,13 @@ def run_pipeline():
     print("[INICIADO] - CARGA DIRETA INICIADA (CSV -> BANCO DE DADOS)")
     try:
         load_all_csvs_directly(folder_path, insert_data)
-        print("[FINALIZADO] - PROCESSO CONCLUÍDO!")
+        print("[FINALIZADO] - INSERÇÃO DAS CAMADAS CONCLUÍDA!")
+    except Exception as e:
+        print(f"[AVISO] - FALHA NA EXECUÇÃO: {e}")
+    print("[INICIADO] - CARGA DOS MUNICÍPIOS")
+    try:
+        load_municipios()
+        print("[FINALIZADO] - INSERÇÃO DE MUNICÍPIOS E UF CONCLUÍDA!")
     except Exception as e:
         print(f"[AVISO] - FALHA NA EXECUÇÃO: {e}")
     
