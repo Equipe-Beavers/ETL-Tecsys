@@ -32,6 +32,18 @@ def download_and_extract_zip(url: str, temp_file_name: str = "temp_data.zip") ->
 
     return raw_paste
 
+def extract_zip(zip_path: str, extract_to: str):
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+            extracted_files = [os.path.join(extract_to, filename) for filename in zip_ref.namelist()]
+
+            return extracted_files
+    except zipfile.BadZipFile:
+        raise ValueError("O arquivo enviado não é um ZIP válido ou está corrompido.")
+    except Exception as e:
+        raise ValueError(f"Erro ao descompactar arquivo zip {str(e)}")
+
 def clean_raw_paste():
     raw_paste = get_raw_paste()
     for item in os.listdir(raw_paste):
