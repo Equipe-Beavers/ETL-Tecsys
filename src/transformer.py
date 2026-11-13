@@ -65,7 +65,7 @@ def transform_bdgd_layer(layer_name: str) -> tuple[pandas.DataFrame, str]:
 
     return df_transformed, paste_name
 
-def transform_bdgd_into_json(extract_dir: str, bdgd_version: any):
+def transform_bdgd_into_json(extract_dir: str, bdgd_version: any, distributor_id: any):
     gdb_path, folder_name = find_gdb_folder(extract_dir)
     columns_filter = {
         "PONNOT":  "postes",
@@ -75,17 +75,15 @@ def transform_bdgd_into_json(extract_dir: str, bdgd_version: any):
 
     response_json = {
         "versao_bdgd": bdgd_version,
+        "id_distribuidora": int(distributor_id)
     }
 
     try:
         available_layers = gpd.list_layers(gdb_path)["name"].tolist()
     except Exception as e:
-        print(f"Erro - {e}")
         available_layers = []
-    print(available_layers)
     for layer in TARGET_LAYERS:
         response_json[columns_filter[layer]] = {}
-        print("-" * 20 + f" Carregando dados da camada {layer} " + 20 * "-")
         matched_layers = next((l for l in available_layers if l.upper() == layer.upper()), None)
         if not matched_layers:
             raise ValueError(f"Camada '{layer}' não existe no .gdb")
