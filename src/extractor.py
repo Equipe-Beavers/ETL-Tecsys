@@ -1,14 +1,40 @@
 from datetime import datetime
+import tempfile
 import os
 import requests
 import zipfile
 import shutil
 
+def get_data_folder():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root =  os.path.dirname(current_dir)
+    data_folder = os.path.join(project_root, "data")
+    os.makedirs(data_folder, exist_ok=True)
+    return data_folder
+
+def download_catalog():
+    catalog_url = "https://hub.arcgis.com/api/feed/all/csv?target=dadosabertos-aneel.opendata.arcgis.com&usePortal=true"
+    data_folder = get_data_folder()
+    filename = "catalog_bdgd.csv"
+    full_path = os.path.join(data_folder, filename)
+    try:
+        response = requests.get(catalog_url, stream=True)
+        if response.status_code == 200:
+            with open(full_path, "wb") as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        file.write(chunk)
+        else:
+            raise ValueError(f"Erro HTTP - {response.status_code}")
+    except Exception as e:
+        raise ValueError(f"Ocorreu um erro ao baixar o arquivo - {e}")
+    return full_path
+
 def get_raw_paste() -> str:
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    projetct_root = os.path.dirname(current_dir)
+    project_root = os.path.dirname(current_dir)
 
-    raw_paste = os.path.join(projetct_root, "data", "raw")
+    raw_paste = os.path.join(project_root, "data", "raw")
     os.makedirs(raw_paste, exist_ok=True)
 
     return raw_paste

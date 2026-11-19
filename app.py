@@ -11,8 +11,11 @@ app = FastAPI()
 @app.post("/process-file")
 async def process_file(file: UploadFile = File(...), bdgd_version: str = Form(...)):
     file_name = os.path.splitext(os.path.splitext(file.filename)[0])[0]
-    match_id = re.search(r"_(\d+)_", file_name)
-    distributor_id = match_id.group(1)
+    match = re.search(r"(.+)_(\d+)_", file_name)
+    if not match:
+        raise HTTPException(status_code=400, detail="Nome do arquivo fora do padrão esperado (Nome_ID)")
+    distributor_name = match.group(1).replace("_", " ")
+    distributor_id = match.group(2)
     file_extension = os.path.splitext(file.filename)[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
         while chunk := await file.read(1024 * 1024):
@@ -25,7 +28,7 @@ async def process_file(file: UploadFile = File(...), bdgd_version: str = Form(..
             else:
                 dest_path = os.path.join(extract_dir, file.filename)
                 os.rename(temp_file_path, dest_path)
-            gdb_json_data = transform_bdgd_into_json(extract_dir, bdgd_version, distributor_id)
+            gdb_json_data = transform_bdgd_into_json(extract_dir, bdgd_version, distributor_id, distributor_name)
             return gdb_json_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro no processamento ETL do arquivo: {str(e)}")
